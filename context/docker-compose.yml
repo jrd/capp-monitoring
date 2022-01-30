@@ -1,0 +1,128 @@
+# vim: set st=2 sts=2 sw=2 et:
+---
+version: '2.4'
+
+networks:
+  monitor-net:
+  grafana:
+
+volumes:
+  prometheus_conf:
+  prometheus_data:
+  grafana_conf:
+  grafana_data:
+
+x-backups:
+  prometheus_data:
+    retention_days: 1
+  grafana_data:
+    retention_days: 1
+
+x-resources:
+  prometheus:
+    memory: "1G"
+    memory_avg: "500M"
+  alertmanager:
+    memory: "50M"
+    memory_avg: "30M"
+  nodeexporter:
+    memory: "100M"
+    memory_avg: "50M"
+    cpu: 2
+  cadvisor:
+    memory: "300M"
+    memory_avg: "200M"
+    cpu: 8
+  healthchecker:
+    memory: "50M"
+    memory_avg: "30M"
+  grafana:
+    memory: "100M"
+    memory_avg: "50M"
+
+services:
+  prometheus:
+    build:
+      context: build/prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus:/tmp/prometheus:ro
+      - prometheus_conf:/etc/prometheus:rw
+      - prometheus_data:/prometheus
+    networks:
+      - monitor-net
+      - grafana
+    labels:
+      org.label-schema.group: "monitoring"
+
+  nodeexporter:
+    build:
+      context: build/nodeexporter
+    restart: unless-stopped
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    networks:
+      - monitor-net
+    labels:
+      org.label-schema.group: "monitoring"
+
+  cadvisor:
+    build:
+      context: build/cadvisor
+    restart: unless-stopped
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+      - /cgroup:/cgroup:ro
+    networks:
+      - monitor-net
+    labels:
+      org.label-schema.group: "monitoring"
+
+  healthchecker:
+    build:
+      context: build/healthchecker
+      args:
+        IMAGE_BASE: ${IMAGE_BASE}
+        TARGET_ENV: ${TARGET_ENV}
+        HEALTHCHECKER_BRANCH: ${HEALTHCHECKER_BRANCH}
+        RLZ: ${RLZ}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - monitor-net
+    labels:
+      org.label-schema.group: "monitoring"
+
+  alertmanager:
+    build:
+      context: build/alertmanager
+    restart: unless-stopped
+    volumes:
+      - ./alertmanager:/etc/alertmanager:ro
+    networks:
+      - monitor-net
+    labels:
+      org.label-schema.group: "monitoring"
+
+  grafana:
+    build:
+      context: build/grafana
+    restart: unless-stopped
+    volumes:
+      - ./grafana:/tmp/grafana:ro
+      - grafana_conf:/etc/grafana/provisioning:rw
+      - grafana_data:/var/lib/grafana:rw
+    environment:
+      - GF_SECURITY_ADMIN_USER=${ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - grafana
+    labels:
+      org.label-schema.group: "monitoring"

@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+from argparse import (
+    Action,
+    ArgumentParser,
+)
+from base64 import b64encode
+from collections import namedtuple
+from functools import partial
+from hashlib import sha256
+from os import (
+    chdir,
+    environ,
+)
+from pathlib import Path
+from re import (
+    search,
+    sub,
+)
+from shutil import (
+    copy2,
+    copytree,
+    rmtree,
+)
+from subprocess import (
+    PIPE,
+    Popen,
+    run,
+)
+from tarfile import open as taropen
+from tempfile import mkdtemp
+from time import sleep
+
+RunResponse = namedtuple('RunResponse', 'code, stdout, stderr')
+
+
+class StoreAsDictKeyValue(Action):
+    def __init__(self, option_strings, **kwargs):
+        if 'dict_key' not in kwargs:
+            raise ValueError('dict_key should be specified when store is StoreAsDictKeyValue')
+        self.dict_key = kwargs.pop('dict_key')
+        kwargs['default'] = dict()
+        super().__init__(option_strings, **kwargs)
+
+    def __call__(self, parser, namespace, value, option_string=None):
+        getattr(namespace, self.dest)[self.dict_key] = value
+
+
+def grep(expr, file_path, as_str=True):
+    with open(file_path) as f:
+        lines = [line for line in f if search(expr, line)]
+        return ''.join(lines).strip() if as_str else lines
+
+
+class Process:
+    def __init__(self, cmd_list, **popen_args):
+        self.popens = [
+            {'cmd': cmd_list, 'args': popen_args},
+        ]
+        self.file_to = None
+
+    def pipe(self, process_or_file):
+        if process_or_file:
+            if hasattr(process_or_file, 'read'):
+                self.file_to = process_or_file
+            elif hasattr(process_or_file, 'popens') and self.file_to is None:
+                for popen in process_or_file.popens:
+                    self.popens.append(popen)
+                self.file_to = process_or_file.file_to
+            else:
+                raise ValueError(f"Cannot pipe to {process_or_file}")
+        return self
+
+    def run(self, encoding='utf8', pipe_to_std=False):
+        try:
+            last_p = None
+            next_stdin = None
+            nb = len(self.popens)
+            for i, popen in enumerate(self.popens):
+                popen['args'].pop('stdin', None)
+                popen['args'].pop('stdout', None)
+                popen['args'].pop('stderr', None)
+                if i == nb - 1:
+                    if self.file_to:
+                        stdout_for_last = self.file_to
+                    else:
+                        stdout_for_last = None if pipe_to_std else PIPE
+                    stderr_for_last = None if pipe_to_std else PIPE
+                else:
+                    stdout_for_last = PIPE
+                    stderr_for_last = PIPE
+                last_p = Popen(
+                    popen['cmd'],
+                    stdin=next_stdin,
+                    stdout=stdout_for_last,
+                    stderr=stderr_for_last,
+                    **popen['args'],
+                )
+                next_stdin = last_p.stdout
+            if pipe_to_std:
+                stdout = stderr = ''
+            else:
+                stdout, stderr = last_p.communicate()
+                if encoding and stdout:
+                    stdout = stdout.decode(encoding)
+                if encoding and stderr:
+                    stderr = stderr.decode(encoding)
+            return_code = last_p.wait()
+        except Exception as e:
+            stdout = ''
+            stderr = str(e)
+            return_code = -1
+        return RunResponse(return_code, stdout, stderr)
+
+    def __str__(self):
+        nb = len(self.popens)
+        if nb == 1:
+            ret = "Process for {}".format(' '.join(self.popens[0]['cmd']))
+        else:
+            ret = "Processes for {}".format(' | '.join([' '.join(popen['cmd']) for popen in self.popens]))
+        if self.file_to is not None:
+            ret += " > {}".format(self.file_to.name)
+        return ret
+
+
+def get_branch(build_dir, component, components):
+    branch = components.get(component)
+    if branch is None:
+        branch_file = build_dir / component / 'branch'
+        if branch_file.exists():
+            branch = branch_file.read_text().strip()
+    return branch
+
+
+def create_release(parser, nocache, dopush, env, release, secrets, ssh_key_path, components):
+    tmp_dir = Path(mkdtemp())
+    try:
+        build_dir = tmp_dir.cwd() / 'build'
+        components_to_build = {comp: branch for comp in components if (branch := get_branch(build_dir, comp, components)) is not None}
+        os_env = {k: v for k, v in environ.items()}
+        os_env.update({f'{comp.upper()}_BRANCH': branch for comp, branch in components_to_build.items()})
+        os_env['PYTHONUNBUFFERED'] = '1'
+        os_env['TARGET_ENV'] = env
+        os_env['RLZ'] = str(release)
+        create_context(tmp_dir, env, secrets, ssh_key_path, components, os_env)
+        if Path('proxy').is_dir():
+            copytree('proxy', tmp_dir / 'proxy')
+        app_name = sub(r'app=', '', grep(r'^app=', tmp_dir / 'metadata'))
+        check_docker(parser)
+        img_dir = tmp_dir / 'images'
+        img_dir.mkdir()
+        rlz_name = app_name + ''.join(f'--{branch}' for branch in components.values() if branch is not None) + f'--{env}--{release}'
+        for component, branch in components_to_build.items():
+            build_component(parser, build_dir, nocache, os_env, app_name, component, branch, env, release)
+        if dopush:
+            for component, branch in components_to_build.items():
+                publish_component_image(parser, os_env, app_name, component, branch, env, release)
+        rlz_name += '.dca'
+        rlz_dir = tmp_dir.cwd().resolve() / 'releases'
+        if not rlz_dir.exists():
+            rlz_dir.mkdir()
+        rlz_path = rlz_dir / rlz_name
+        create_dca(rlz_path, tmp_dir)
+        create_sha256(rlz_path)
+        return rlz_path
+    finally:
+        rmtree(tmp_dir)
+
+
+def create_context(tmp_dir, env, secrets, ssh_key_path, components, os_env):
+    ctx_dir = tmp_dir / 'context'
+    copytree('context', ctx_dir)
+    metadata_dict = dict()
+    for fp in ('metadata', *secrets.glob('extra_metadata')):
+        with open(fp) as f:
+            for line in f:
+                if '=' in line:
+                    key, value = line.strip().split('=', 1)
+                    metadata_dict[key] = value
+    with open(tmp_dir / 'metadata', 'w') as fw:
+        fw.write(f'target_env={env}\n')
+        for key, value in metadata_dict.items():
+            fw.write(f'{key}={value}\n')
+        for component, branch in components.items():
+            if branch:
+                fw.write(f'{component}_version={branch}\n')
+    extra_context = secrets.glob('context/*')
+    for f in extra_context:
+        if f.is_dir():
+            copytree(f, ctx_dir / f.name)
+        else:
+            copy2(f, ctx_dir)
+    run(['docker-compose', 'config', '-q'], check=True, cwd=ctx_dir, env=os_env)
+    docker_compose_path = ctx_dir / 'docker-compose.yml'
+    with open(docker_compose_path, 'r+') as f:
+        dc = f.read()
+        for key, value in sorted(os_env.items(), reverse=True):
+            dc = sub(r'\$\{?' + key + r'\}?', value, dc)
+        f.seek(0)
+        f.truncate()
+        f.write(dc)
+    if ssh_key_path:
+        sign_tmp_dir = Path(mkdtemp())
+        try:
+            tmp_private_key = sign_tmp_dir / 'key.pem'
+            copy2(ssh_key_path, tmp_private_key)
+            run(['ssh-keygen', '-e', '-f', str(tmp_private_key), '-m', 'pkcs8', '-p', '-P', '', '-N', ''], check=True)
+            sign = run([
+                'openssl', 'dgst',
+                '-sha256',
+                '-sign', str(tmp_private_key),
+                str(docker_compose_path),
+            ], check=True, capture_output=True).stdout
+            sign_base64 = b64encode(sign).decode('ascii')
+            with open('metadata') as fr:
+                with open(tmp_dir / 'metadata', 'w') as fw:
+                    fw.write(f'target_env={env}\n')
+                    fw.write(f'signature={sign_base64}\n')
+                    for line in fr:
+                        fw.write(line)
+                    fw.write('\n')
+        finally:
+            rmtree(sign_tmp_dir)
+
+
+def check_docker(parser):
+    run(['docker', 'login', 'registry.gitlab.com'], capture_output=True, check=True)
+
+
+def build_component(parser, build_dir, nocache, os_env, app_name, component, branch, env, release):
+    print(f'BUILDING {app_name} {component}')
+    args = [str(build_dir / component / 'build'), app_name, component, branch, env, str(release)]
+    if nocache:
+        args.append('--no-cache')
+    response = Process(args, env=os_env).run(pipe_to_std=True)
+    if response.code != 0:
+        parser.error(f'exit code {response.code}\n{response.stderr}')
+
+
+def publish_component_image(parser, os_env, app_name, component, branch, env, release):
+    image_base = next(
+        line.strip() for line in (Path('.') / 'context' / '.env').open().readlines()
+        if line.startswith('IMAGE_BASE=')
+    ).split('=')[1]
+    img_name = f'{image_base}/{app_name}/{component}:{env}-{branch}-{release}'
+    print(f'PUBLISHING {img_name}')
+    response = Process(['docker', 'push', img_name], env=os_env).run(pipe_to_std=True)
+    if response.code != 0:
+        parser.error(f'exit code {response.code}\n{response.stderr}')
+
+
+def create_dca(rlz_path, tmp_dir):
+    print(f'CREATING {rlz_path}')
+    with taropen(rlz_path, 'w:gz') as tar:
+        tar.add(tmp_dir, arcname='.')
+
+
+def create_sha256(rlz_path):
+    CHUNK_SIZE = 1024 * 1024  # 1 MB
+    with open(rlz_path, 'rb') as f1:
+        with open(rlz_path.with_suffix(rlz_path.suffix + '.sha256'), 'w') as f2:
+            h = sha256()
+            for chunk in iter(partial(f1.read, CHUNK_SIZE), b''):
+                h.update(chunk)
+            f2.write(f'{h.hexdigest()}  {rlz_path.name}\n')
+
+
+def deploy_dca(parser, rlz_path):
+    deploy_host = environ['DEPLOY_HOST']
+    print(f'DEPLOYING {rlz_path} to {deploy_host}')
+    run(['scp', '-P', '122', f'{rlz_path}', f'{rlz_path}.sha256', f'dca@{deploy_host}:'], check=True)
+    run(['ssh', '-t', f'deploy@{deploy_host}', 'deploy', rlz_path.name], check=True)
+
+
+def main(sys_args):
+    here = Path(__file__).resolve().parent
+    chdir(here)
+    app_name = sub(r'app=', '', grep(r'^app=', 'metadata'))
+    parser = ArgumentParser(
+        description=f"Create a DCA release for {app_name}",
+        epilog="""
+        If confs/ENV/context/ exists its contents will be copied
+        to the regular context directory.
+        If the same file exists in both directories, the file in
+        confs/ENV/context/ will squash the other one.""",
+    )
+    parser.add_argument(
+        'ssh_key',
+        help="your private SSH key file path to sign this release")
+    parser.add_argument(
+        'env',
+        choices=['dev', 'integ', 'staging', 'demo', 'prod'],
+        help="confs/ENV should be an existing directory")
+    parser.add_argument(
+        'release', nargs='?', type=int, default=1,
+        help="release number, default to 1")
+    parser.add_argument(
+        '-c', '--nocache', dest='nocache', action='store_true',
+        help="disable docker layers caching mechanism")
+    parser.add_argument(
+        '-p', '--nopush', dest='dopush', action='store_false',
+        help="disable docker image push. Without that you cannot deploy your DCA.")
+    parser.add_argument(
+        '-d', '--deploy', dest='dodeploy', action='store_true',
+        help="deploy the DCA to DEPLOY_HOST. You must check your rights to do so.")
+    components = sorted([p.name for p in (here / 'build').iterdir() if p.is_dir()]) if (here / 'build').exists() else []
+    for component in components:
+        if (here / 'build' / component / 'skip-ver').exists():
+            continue
+        parser.add_argument(f'--{component}', metavar='BRANCH/TAG', required=True,
+                            dest='comps', dict_key=component, action=StoreAsDictKeyValue,
+                            help=f"git tag or git branch of {app_name} {component}")
+    args = parser.parse_args(args=sys_args)
+    private_key = Path(args.ssh_key).resolve()
+    if not private_key.exists():
+        parser.error(f"{args.ssh_key} should be an existing SSH private key file")
+    secrets = (Path('.') / 'confs' / args.env).resolve()
+    if not secrets.is_dir():
+        parser.error("confs/ENV should be an existing directory")
+    if args.dodeploy and not environ.get('DEPLOY_HOST'):
+        parser.error("you should define the DEPLOY_HOST variable")
+    comps = {comp: getattr(args, 'comps', {}).get(comp) for comp in components}
+    args.dopush |= args.dodeploy  # force to push if deploy
+    rlz_path = create_release(parser, args.nocache, args.dopush, args.env, args.release, secrets, private_key, comps)
+    if args.dodeploy:
+        sleep(1)  # wait a bit for the docker image registry to be ok to be queried
+        deploy_dca(parser, rlz_path)
+
+
+if __name__ == '__main__':
+    from sys import argv
+    main(argv[1:])

@@ -1,0 +1,5 @@
+version=2
+# to allow binding /proc or /var/lib/docker.sock
+privileged=1
+app=monitoring
+grafana_base_vhost=monitoring

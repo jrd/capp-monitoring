@@ -1,0 +1,3 @@
+ARG IMAGE_BASE TARGET_ENV HEALTHCHECKER_BRANCH RLZ
+FROM ${IMAGE_BASE}/monitoring/healthchecker:${TARGET_ENV}-${HEALTHCHECKER_BRANCH}-${RLZ}
+RUN apk update && apk upgrade

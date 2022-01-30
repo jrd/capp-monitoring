@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+if [ -n "$1" ] && echo "$1" | grep -q '^/' && [ -x "$1" ]; then
+    prog="$1"
+    shift
+    exec "$prog" "$@"
+fi
+[ -d /tmp/prometheus ]
+[ -d /etc/prometheus ]
+cp -rv /tmp/prometheus/* /etc/prometheus/
+# pass the execution to the prometheus binary
+exec /bin/prometheus \
+    --config.file=/etc/prometheus/prometheus.yml \
+    --storage.tsdb.path=/prometheus \
+    --web.console.libraries=/usr/share/prometheus/console_libraries \
+    --web.console.templates=/usr/share/prometheus/consoles \
+    --storage.tsdb.retention.time=200h \
+    --web.enable-lifecycle \
+    "$@"

@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+if [ -n "$1" ] && echo "$1" | grep -q '^/' && [ -x "$1" ]; then
+    prog="$1"
+    shift
+    exec "$prog" "$@"
+fi
+[ -d /tmp/grafana ]
+[ -d /etc/grafana/provisioning ]
+cp -rv /tmp/grafana/* /etc/grafana/provisioning/
+# pass the execution to the original grafana entrypoint
+exec /run.sh
